@@ -10,6 +10,8 @@
 (define-constant err-unauthorized-pharmacist (err u106))
 (define-constant err-invalid-prescription (err u107))
 (define-constant err-prescription-already-exists (err u108))
+(define-constant err-insufficient-quantity (err u109))
+(define-constant err-invalid-quantity (err u110))
 
 (define-data-var token-id-nonce uint u1)
 
@@ -30,11 +32,14 @@
         drug-name: (string-ascii 64),
         dosage: (string-ascii 32),
         quantity: uint,
+        remaining-quantity: uint,
         issue-date: uint,
         expiry-date: uint,
         dispensed: bool,
         dispensed-by: (optional principal),
         dispensed-at: (optional uint),
+        partially-dispensed: bool,
+        dispensation-count: uint,
         notes: (string-ascii 256),
     }
 )
@@ -80,9 +85,9 @@
         prescription-info (let (
                 (current-block stacks-block-height)
                 (expiry-block (get expiry-date prescription-info))
-                (is-dispensed (get dispensed prescription-info))
+                (remaining-qty (get remaining-quantity prescription-info))
             )
-            (and (< current-block expiry-block) (not is-dispensed))
+            (and (< current-block expiry-block) (> remaining-qty u0))
         )
         false
     )
@@ -165,11 +170,14 @@
             drug-name: drug-name,
             dosage: dosage,
             quantity: quantity,
+            remaining-quantity: quantity,
             issue-date: current-block,
             expiry-date: expiry-date,
             dispensed: false,
             dispensed-by: none,
             dispensed-at: none,
+            partially-dispensed: false,
+            dispensation-count: u0,
             notes: notes,
         })
 
@@ -210,6 +218,51 @@
     )
 )
 
+(define-public (partial-dispense-prescription
+        (token-id uint)
+        (dispense-quantity uint)
+    )
+    (let (
+            (prescription-info (unwrap! (map-get? prescription-data token-id)
+                err-prescription-not-found
+            ))
+            (current-block stacks-block-height)
+            (remaining-qty (get remaining-quantity prescription-info))
+            (new-remaining-qty (- remaining-qty dispense-quantity))
+            (new-dispensation-count (+ (get dispensation-count prescription-info) u1))
+        )
+        (asserts! (is-authorized-pharmacist tx-sender)
+            err-unauthorized-pharmacist
+        )
+        (asserts! (> remaining-qty u0) err-prescription-already-dispensed)
+        (asserts! (< current-block (get expiry-date prescription-info))
+            err-prescription-expired
+        )
+        (asserts! (> dispense-quantity u0) err-invalid-quantity)
+        (asserts! (<= dispense-quantity remaining-qty) err-insufficient-quantity)
+
+        (map-set prescription-data token-id
+            (merge prescription-info {
+                remaining-quantity: new-remaining-qty,
+                dispensed: (is-eq new-remaining-qty u0),
+                dispensed-by: (some tx-sender),
+                dispensed-at: (if (is-eq new-remaining-qty u0)
+                    (some current-block)
+                    (get dispensed-at prescription-info)
+                ),
+                partially-dispensed: (> new-dispensation-count u0),
+                dispensation-count: new-dispensation-count,
+            })
+        )
+
+        (ok {
+            dispensed-quantity: dispense-quantity,
+            remaining-quantity: new-remaining-qty,
+            fully-dispensed: (is-eq new-remaining-qty u0),
+        })
+    )
+)
+
 (define-public (verify-prescription (token-id uint))
     (match (map-get? prescription-data token-id)
         prescription-info (let (
@@ -218,7 +271,7 @@
                 (is-dispensed (get dispensed prescription-info))
             )
             (ok {
-                valid: (and (< current-block expiry-block) (not is-dispensed)),
+                valid: (and (< current-block expiry-block) (> (get remaining-quantity prescription-info) u0)),
                 expired: (>= current-block expiry-block),
                 dispensed: is-dispensed,
                 doctor: (get doctor prescription-info),
@@ -226,10 +279,13 @@
                 drug-name: (get drug-name prescription-info),
                 dosage: (get dosage prescription-info),
                 quantity: (get quantity prescription-info),
+                remaining-quantity: (get remaining-quantity prescription-info),
                 issue-date: (get issue-date prescription-info),
                 expiry-date: expiry-block,
                 dispensed-by: (get dispensed-by prescription-info),
                 dispensed-at: (get dispensed-at prescription-info),
+                partially-dispensed: (get partially-dispensed prescription-info),
+                dispensation-count: (get dispensation-count prescription-info),
             })
         )
         err-prescription-not-found
@@ -251,6 +307,29 @@
             err-not-token-owner
         )
         (nft-transfer? prescription-nft token-id sender recipient)
+    )
+)
+
+(define-read-only (get-remaining-quantity (token-id uint))
+    (match (map-get? prescription-data token-id)
+        prescription-info (ok (get remaining-quantity prescription-info))
+        err-prescription-not-found
+    )
+)
+
+(define-read-only (get-dispensation-history (token-id uint))
+    (match (map-get? prescription-data token-id)
+        prescription-info (ok {
+            original-quantity: (get quantity prescription-info),
+            remaining-quantity: (get remaining-quantity prescription-info),
+            dispensed-quantity: (- (get quantity prescription-info)
+                (get remaining-quantity prescription-info)
+            ),
+            dispensation-count: (get dispensation-count prescription-info),
+            partially-dispensed: (get partially-dispensed prescription-info),
+            fully-dispensed: (get dispensed prescription-info),
+        })
+        err-prescription-not-found
     )
 )
 
@@ -280,20 +359,26 @@
                 drug-name: (get drug-name prescription-info),
                 dosage: (get dosage prescription-info),
                 quantity: (get quantity prescription-info),
+                remaining-quantity: (get remaining-quantity prescription-info),
                 issue-date: (get issue-date prescription-info),
                 expiry-date: expiry-block,
                 dispensed: is-dispensed,
                 dispensed-by: (get dispensed-by prescription-info),
                 dispensed-at: (get dispensed-at prescription-info),
+                partially-dispensed: (get partially-dispensed prescription-info),
+                dispensation-count: (get dispensation-count prescription-info),
                 notes: (get notes prescription-info),
                 status: (if is-dispensed
                     "dispensed"
                     (if is-expired
                         "expired"
-                        "valid"
+                        (if (get partially-dispensed prescription-info)
+                            "partially-dispensed"
+                            "valid"
+                        )
                     )
                 ),
-                valid: (and (not is-expired) (not is-dispensed)),
+                valid: (and (not is-expired) (> (get remaining-quantity prescription-info) u0)),
             })
         )
         none
