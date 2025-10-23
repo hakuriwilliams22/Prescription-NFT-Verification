@@ -12,6 +12,7 @@
 (define-constant err-prescription-already-exists (err u108))
 (define-constant err-insufficient-quantity (err u109))
 (define-constant err-invalid-quantity (err u110))
+(define-constant err-invalid-refill (err u111))
 
 (define-data-var token-id-nonce uint u1)
 
@@ -419,6 +420,50 @@
         )
 
         (ok true)
+    )
+)
+
+(define-public (refill-prescription
+        (token-id uint)
+        (additional-quantity uint)
+        (extend-blocks uint)
+    )
+    (let (
+            (prescription-info (unwrap! (map-get? prescription-data token-id)
+                err-prescription-not-found
+            ))
+            (current-block stacks-block-height)
+            (current-expiry (get expiry-date prescription-info))
+            (current-remaining (get remaining-quantity prescription-info))
+            (has-increment (> additional-quantity u0))
+            (has-extension (> extend-blocks u0))
+        )
+        (asserts! (is-eq tx-sender (get doctor prescription-info))
+            err-unauthorized-doctor
+        )
+        (asserts! (not (get dispensed prescription-info))
+            err-prescription-already-dispensed
+        )
+        (asserts! (< current-block current-expiry) err-prescription-expired)
+        (asserts! (or has-increment has-extension) err-invalid-refill)
+        (let (
+                (new-remaining (+ current-remaining additional-quantity))
+                (new-expiry (if has-extension
+                    (+ current-expiry extend-blocks)
+                    current-expiry
+                ))
+            )
+            (map-set prescription-data token-id
+                (merge prescription-info {
+                    remaining-quantity: new-remaining,
+                    expiry-date: new-expiry,
+                })
+            )
+            (ok {
+                remaining-quantity: new-remaining,
+                expiry-date: new-expiry,
+            })
+        )
     )
 )
 
