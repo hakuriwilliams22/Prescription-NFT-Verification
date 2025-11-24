@@ -13,6 +13,7 @@
 (define-constant err-insufficient-quantity (err u109))
 (define-constant err-invalid-quantity (err u110))
 (define-constant err-invalid-refill (err u111))
+(define-constant err-prescription-locked (err u112))
 
 (define-data-var token-id-nonce uint u1)
 
@@ -48,6 +49,15 @@
 (define-map prescription-hash
     (buff 32)
     uint
+)
+
+(define-map prescription-locks
+    uint
+    {
+        locked: bool,
+        reason: (string-ascii 128),
+        set-by: principal,
+    }
 )
 
 (define-read-only (get-last-token-id)
@@ -196,10 +206,16 @@
                 err-prescription-not-found
             ))
             (current-block stacks-block-height)
+            (lock-entry (map-get? prescription-locks token-id))
+            (is-locked (match lock-entry
+                lock-data (get locked lock-data)
+                false
+            ))
         )
         (asserts! (is-authorized-pharmacist tx-sender)
             err-unauthorized-pharmacist
         )
+        (asserts! (not is-locked) err-prescription-locked)
         (asserts! (not (get dispensed prescription-info))
             err-prescription-already-dispensed
         )
@@ -231,10 +247,16 @@
             (remaining-qty (get remaining-quantity prescription-info))
             (new-remaining-qty (- remaining-qty dispense-quantity))
             (new-dispensation-count (+ (get dispensation-count prescription-info) u1))
+            (lock-entry (map-get? prescription-locks token-id))
+            (is-locked (match lock-entry
+                lock-data (get locked lock-data)
+                false
+            ))
         )
         (asserts! (is-authorized-pharmacist tx-sender)
             err-unauthorized-pharmacist
         )
+        (asserts! (not is-locked) err-prescription-locked)
         (asserts! (> remaining-qty u0) err-prescription-already-dispensed)
         (asserts! (< current-block (get expiry-date prescription-info))
             err-prescription-expired
@@ -511,5 +533,47 @@
             (ok false)
         )
         (ok false)
+    )
+)
+
+(define-read-only (get-prescription-lock (token-id uint))
+    (map-get? prescription-locks token-id)
+)
+
+(define-public (lock-prescription
+        (token-id uint)
+        (reason (string-ascii 128))
+    )
+    (let ((prescription-info (unwrap! (map-get? prescription-data token-id) err-prescription-not-found)))
+        (asserts! (is-eq tx-sender (get doctor prescription-info))
+            err-unauthorized-doctor
+        )
+        (asserts! (not (get dispensed prescription-info))
+            err-prescription-already-dispensed
+        )
+
+        (map-set prescription-locks token-id {
+            locked: true,
+            reason: reason,
+            set-by: tx-sender,
+        })
+
+        (ok true)
+    )
+)
+
+(define-public (unlock-prescription (token-id uint))
+    (let ((prescription-info (unwrap! (map-get? prescription-data token-id) err-prescription-not-found)))
+        (asserts! (is-eq tx-sender (get doctor prescription-info))
+            err-unauthorized-doctor
+        )
+
+        (map-set prescription-locks token-id {
+            locked: false,
+            reason: "",
+            set-by: tx-sender,
+        })
+
+        (ok true)
     )
 )
